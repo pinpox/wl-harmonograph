@@ -4,6 +4,7 @@
 import math
 import os
 import random
+import signal
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -285,6 +286,8 @@ class WallpaperApp:
 
 
 def main():
+    signal.signal(signal.SIGINT, lambda *_: Gtk.main_quit())
+    signal.signal(signal.SIGTERM, lambda *_: Gtk.main_quit())
     app = WallpaperApp()
     Gtk.main()
 
