@@ -97,6 +97,7 @@ struct GlRenderer {
     blit_program: glow::Program,
     blit_vbo: glow::Buffer,
     u_color: glow::UniformLocation,
+    u_bg: glow::UniformLocation,
     a_pos: u32,
     a_cross: u32,
     width: u32,
@@ -104,7 +105,7 @@ struct GlRenderer {
 }
 
 impl GlRenderer {
-    unsafe fn new(gl: glow::Context, width: u32, height: u32, bg: Color) -> Self {
+    unsafe fn new(gl: glow::Context, width: u32, height: u32) -> Self {
         // --- Line drawing shader with edge antialiasing ---
         let vs_src = r#"#version 100
             attribute vec2 a_pos;
@@ -130,7 +131,7 @@ impl GlRenderer {
         let a_pos = gl.get_attrib_location(program, "a_pos").unwrap();
         let a_cross = gl.get_attrib_location(program, "a_cross").unwrap();
 
-        // --- Blit shader (FBO texture → screen) ---
+        // --- Blit shader (composite FBO over background color) ---
         let blit_vs = r#"#version 100
             attribute vec2 a_pos;
             varying vec2 v_uv;
@@ -143,11 +144,14 @@ impl GlRenderer {
             precision mediump float;
             varying vec2 v_uv;
             uniform sampler2D u_tex;
+            uniform vec3 u_bg;
             void main() {
-                gl_FragColor = texture2D(u_tex, v_uv);
+                vec4 texel = texture2D(u_tex, v_uv);
+                gl_FragColor = vec4(mix(u_bg, texel.rgb, texel.a), 1.0);
             }
         "#;
         let blit_program = Self::create_program(&gl, blit_vs, blit_fs);
+        let u_bg = gl.get_uniform_location(blit_program, "u_bg").unwrap();
 
         // VBO for line strips
         let vbo = gl.create_buffer().unwrap();
@@ -165,10 +169,10 @@ impl GlRenderer {
         // Create FBO + texture
         let (fbo, fbo_texture) = Self::create_fbo(&gl, width, height);
 
-        // Clear FBO with background color
+        // Clear FBO to fully transparent
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
         gl.viewport(0, 0, width as i32, height as i32);
-        gl.clear_color(bg.0 as f32, bg.1 as f32, bg.2 as f32, 1.0);
+        gl.clear_color(0.0, 0.0, 0.0, 0.0);
         gl.clear(glow::COLOR_BUFFER_BIT);
         gl.bind_framebuffer(glow::FRAMEBUFFER, None);
 
@@ -181,6 +185,7 @@ impl GlRenderer {
             blit_program,
             blit_vbo,
             u_color,
+            u_bg,
             a_pos,
             a_cross,
             width,
@@ -265,6 +270,39 @@ impl GlRenderer {
         (fbo, tex)
     }
 
+    /// Reduce the alpha of every pixel in the FBO, keeping RGB intact.
+    /// This makes older lines become more transparent each frame while
+    /// preserving their original color/saturation.
+    unsafe fn fade(&self, fade_amount: f32) {
+        let gl = &self.gl;
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
+        gl.viewport(0, 0, self.width as i32, self.height as i32);
+
+        gl.enable(glow::BLEND);
+        // Color: keep unchanged (dst * 1)
+        // Alpha: multiply by (1 - fade_amount) via dst * src_alpha
+        gl.blend_func_separate(
+            glow::ZERO,
+            glow::ONE,
+            glow::ZERO,
+            glow::ONE_MINUS_SRC_ALPHA,
+        );
+
+        gl.use_program(Some(self.program));
+        gl.uniform_4_f32(Some(&self.u_color), 0.0, 0.0, 0.0, fade_amount);
+
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.blit_vbo));
+        gl.enable_vertex_attrib_array(self.a_pos);
+        gl.vertex_attrib_pointer_f32(self.a_pos, 2, glow::FLOAT, false, 8, 0);
+        gl.disable_vertex_attrib_array(self.a_cross);
+        gl.vertex_attrib_1_f32(self.a_cross, 0.0);
+
+        gl.draw_arrays(glow::TRIANGLES, 0, 6);
+
+        gl.disable_vertex_attrib_array(self.a_pos);
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+    }
+
     /// Draw a triangle strip (the thickened curve segment) into the FBO.
     /// Vertices are packed as [x, y, cross] where cross is -1.0 or +1.0
     /// indicating which side of the line center the vertex is on (for AA).
@@ -274,7 +312,13 @@ impl GlRenderer {
         gl.viewport(0, 0, self.width as i32, self.height as i32);
 
         gl.enable(glow::BLEND);
-        gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+        // Porter-Duff "over": proper alpha compositing into the FBO
+        gl.blend_func_separate(
+            glow::SRC_ALPHA,
+            glow::ONE_MINUS_SRC_ALPHA,
+            glow::ONE,
+            glow::ONE_MINUS_SRC_ALPHA,
+        );
 
         gl.use_program(Some(self.program));
         gl.uniform_4_f32(
@@ -306,14 +350,15 @@ impl GlRenderer {
         gl.bind_framebuffer(glow::FRAMEBUFFER, None);
     }
 
-    /// Blit the FBO texture to the default framebuffer (screen).
-    unsafe fn blit_to_screen(&self) {
+    /// Blit the FBO texture to the default framebuffer, compositing over bg.
+    unsafe fn blit_to_screen(&self, bg: Color) {
         let gl = &self.gl;
         gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         gl.viewport(0, 0, self.width as i32, self.height as i32);
 
         gl.disable(glow::BLEND);
         gl.use_program(Some(self.blit_program));
+        gl.uniform_3_f32(Some(&self.u_bg), bg.0 as f32, bg.1 as f32, bg.2 as f32);
 
         gl.active_texture(glow::TEXTURE0);
         gl.bind_texture(glow::TEXTURE_2D, Some(self.fbo_texture));
@@ -328,12 +373,12 @@ impl GlRenderer {
         gl.disable_vertex_attrib_array(a_pos);
     }
 
-    /// Clear the FBO with a background color.
-    unsafe fn clear(&self, bg: Color) {
+    /// Clear the FBO to fully transparent.
+    unsafe fn clear(&self) {
         let gl = &self.gl;
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
         gl.viewport(0, 0, self.width as i32, self.height as i32);
-        gl.clear_color(bg.0 as f32, bg.1 as f32, bg.2 as f32, 1.0);
+        gl.clear_color(0.0, 0.0, 0.0, 0.0);
         gl.clear(glow::COLOR_BUFFER_BIT);
         gl.bind_framebuffer(glow::FRAMEBUFFER, None);
     }
@@ -409,7 +454,6 @@ impl App {
     }
 
     fn restart(&mut self) {
-        let bg = self.bg_color;
         let egl = khronos_egl::Instance::new(khronos_egl::Static);
         for (_wl, osurface) in &mut self.outputs {
             if let Some(os) = osurface {
@@ -421,7 +465,7 @@ impl App {
                         Some(self.egl_context),
                     )
                     .unwrap();
-                    unsafe { renderer.clear(bg) };
+                    unsafe { renderer.clear() };
                 }
             }
         }
@@ -433,6 +477,9 @@ impl App {
         let color = self.current_color;
         let steps = self.steps_per_tick;
         let egl = khronos_egl::Instance::new(khronos_egl::Static);
+
+        // Reduce alpha of existing content each frame
+        self.fade_all_outputs(&egl);
 
         // Accumulate all simulation steps into one continuous triangle strip
         // so there are no gaps at segment joints.
@@ -471,6 +518,30 @@ impl App {
         }
     }
 
+    fn fade_all_outputs(&mut self, egl: &khronos_egl::Instance<khronos_egl::Static>) {
+        for (_wl, osurface) in &mut self.outputs {
+            if let Some(os) = osurface {
+                if !os.configured {
+                    continue;
+                }
+                if let Some(ref renderer) = os.renderer {
+                    egl.make_current(
+                        self.egl_display,
+                        Some(os.egl_surface),
+                        Some(os.egl_surface),
+                        Some(self.egl_context),
+                    )
+                    .unwrap();
+                    unsafe {
+                        // Reduce alpha by 0.005 per frame at ~30fps.
+                        // Lines fade to transparent over ~7 seconds.
+                        renderer.fade(0.005);
+                    }
+                }
+            }
+        }
+    }
+
     fn draw_on_all_outputs(
         &mut self,
         egl: &khronos_egl::Instance<khronos_egl::Static>,
@@ -499,6 +570,7 @@ impl App {
     }
 
     fn present_all(&mut self, egl: &khronos_egl::Instance<khronos_egl::Static>) {
+        let bg = self.bg_color;
         for (_wl, osurface) in &mut self.outputs {
             if let Some(os) = osurface {
                 if !os.configured {
@@ -513,7 +585,7 @@ impl App {
                     )
                     .unwrap();
                     unsafe {
-                        renderer.blit_to_screen();
+                        renderer.blit_to_screen(bg);
                     }
                     egl.swap_buffers(self.egl_display, os.egl_surface).unwrap();
                     os.layer
@@ -622,7 +694,7 @@ impl App {
                 })
             };
 
-            let renderer = unsafe { GlRenderer::new(gl, os.width, os.height, self.bg_color) };
+            let renderer = unsafe { GlRenderer::new(gl, os.width, os.height) };
             os.renderer = Some(renderer);
             info!("GL renderer initialized for {}x{}", os.width, os.height);
         }
