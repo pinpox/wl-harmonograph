@@ -13,36 +13,32 @@
       packages = forAllSystems (system:
         let
           pkgs = nixpkgsFor.${system};
-
-          pythonEnv = pkgs.python3.withPackages (ps: [
-            ps.pygobject3
-            ps.pycairo
-          ]);
-
-          runtimeDeps = with pkgs; [
-            gtk3
-            gtk-layer-shell
-            gobject-introspection
-          ];
         in {
-          default = pkgs.stdenv.mkDerivation {
+          default = pkgs.rustPlatform.buildRustPackage {
             pname = "wl-harmonograph";
             inherit version;
 
             src = ./.;
 
-            nativeBuildInputs = [ pkgs.wrapGAppsHook3 pkgs.gobject-introspection pkgs.makeWrapper ];
+            cargoHash = "sha256-jvCq3NQBIoK0ZctDeTeFi9eXIi7mbZYDF6RoiWCk7JY=";
 
-            buildInputs = [ pythonEnv ] ++ runtimeDeps;
+            nativeBuildInputs = with pkgs; [
+              pkg-config
+            ];
 
-            dontBuild = true;
+            buildInputs = with pkgs; [
+              wayland
+              libGL
+              libglvnd
+            ];
 
-            installPhase = ''
-              mkdir -p $out/bin $out/share/wl-harmonograph
-              cp wl-harmonograph.py $out/share/wl-harmonograph/wl-harmonograph.py
-
-              makeWrapper ${pythonEnv}/bin/python3 $out/bin/wl-harmonograph \
-                --add-flags "$out/share/wl-harmonograph/wl-harmonograph.py"
+            # khronos-egl with "static" feature links EGL statically,
+            # but still needs the GL driver at runtime.
+            postFixup = ''
+              patchelf --add-rpath ${pkgs.lib.makeLibraryPath [
+                pkgs.libglvnd
+                pkgs.mesa
+              ]} $out/bin/wl-harmonograph
             '';
 
             meta = with pkgs.lib; {
