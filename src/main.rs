@@ -421,6 +421,7 @@ struct App {
     shm: Shm,
     qh: QueueHandle<Self>,
 
+    egl: khronos_egl::Instance<khronos_egl::Static>,
     egl_display: khronos_egl::Display,
     egl_context: khronos_egl::Context,
     egl_config: khronos_egl::Config,
@@ -454,17 +455,17 @@ impl App {
     }
 
     fn restart(&mut self) {
-        let egl = khronos_egl::Instance::new(khronos_egl::Static);
         for (_wl, osurface) in &mut self.outputs {
             if let Some(os) = osurface {
                 if let Some(ref renderer) = os.renderer {
-                    egl.make_current(
-                        self.egl_display,
-                        Some(os.egl_surface),
-                        Some(os.egl_surface),
-                        Some(self.egl_context),
-                    )
-                    .unwrap();
+                    self.egl
+                        .make_current(
+                            self.egl_display,
+                            Some(os.egl_surface),
+                            Some(os.egl_surface),
+                            Some(self.egl_context),
+                        )
+                        .unwrap();
                     unsafe { renderer.clear() };
                 }
             }
@@ -475,119 +476,67 @@ impl App {
 
     fn tick(&mut self) {
         let color = self.current_color;
+        let bg = self.bg_color;
         let steps = self.steps_per_tick;
-        let egl = khronos_egl::Instance::new(khronos_egl::Static);
-
-        // Reduce alpha of existing content each frame
-        self.fade_all_outputs(&egl);
-
-        // Accumulate all simulation steps into one continuous triangle strip
-        // so there are no gaps at segment joints.
-        let mut verts: Vec<[f32; 3]> = Vec::new();
+        let mut advanced = false;
 
         for _ in 0..steps {
             if !self.harmonograph.advance() {
-                // Draw whatever we accumulated before restarting
-                if !verts.is_empty() {
-                    self.draw_on_all_outputs(&egl, &verts, color);
-                }
+                // Render whatever we have, then restart
+                self.render_all_outputs(advanced, color, bg);
                 self.restart();
-                self.present_all(&egl);
+                self.render_all_outputs(false, color, bg);
                 return;
             }
-
-            // Append this segment's vertices to the continuous strip.
-            // The Python version used `scale = min(w, h) * 0.4` in pixel
-            // coords for both axes, keeping the pattern square. In NDC [-1,1]
-            // we need per-axis scaling: the shorter axis gets scale 0.4
-            // (pendulum ±1 maps to ±0.4 of NDC) while the longer axis is
-            // shrunk by the aspect ratio to preserve 1:1 proportions.
-            // Line width 0.002 in NDC ≈ 1.9px at 960 logical height.
-            self.harmonograph.append_catmull_rom_strip(
-                self.scale_x,
-                self.scale_y,
-                0.002,
-                16,
-                &mut verts,
-            );
+            advanced = true;
         }
 
-        if !verts.is_empty() {
-            self.draw_on_all_outputs(&egl, &verts, color);
-            self.present_all(&egl);
+        if advanced {
+            self.render_all_outputs(true, color, bg);
         }
     }
 
-    fn fade_all_outputs(&mut self, egl: &khronos_egl::Instance<khronos_egl::Static>) {
+    /// Perform all GL work for one frame on every output.
+    /// Computes per-output vertices so line width is consistent in pixels.
+    fn render_all_outputs(&mut self, draw: bool, color: Color, bg: Color) {
+        let mut verts: Vec<[f32; 3]> = Vec::new();
+
         for (_wl, osurface) in &mut self.outputs {
             if let Some(os) = osurface {
                 if !os.configured {
                     continue;
                 }
                 if let Some(ref renderer) = os.renderer {
-                    egl.make_current(
-                        self.egl_display,
-                        Some(os.egl_surface),
-                        Some(os.egl_surface),
-                        Some(self.egl_context),
-                    )
-                    .unwrap();
+                    self.egl
+                        .make_current(
+                            self.egl_display,
+                            Some(os.egl_surface),
+                            Some(os.egl_surface),
+                            Some(self.egl_context),
+                        )
+                        .unwrap();
                     unsafe {
-                        // Reduce alpha by 0.005 per frame at ~30fps.
-                        // Lines fade to transparent over ~7 seconds.
                         renderer.fade(0.005);
-                    }
-                }
-            }
-        }
-    }
-
-    fn draw_on_all_outputs(
-        &mut self,
-        egl: &khronos_egl::Instance<khronos_egl::Static>,
-        verts: &[[f32; 3]],
-        color: Color,
-    ) {
-        for (_wl, osurface) in &mut self.outputs {
-            if let Some(os) = osurface {
-                if !os.configured {
-                    continue;
-                }
-                if let Some(ref renderer) = os.renderer {
-                    egl.make_current(
-                        self.egl_display,
-                        Some(os.egl_surface),
-                        Some(os.egl_surface),
-                        Some(self.egl_context),
-                    )
-                    .unwrap();
-                    unsafe {
-                        renderer.draw_strip(verts, color, 0.85);
-                    }
-                }
-            }
-        }
-    }
-
-    fn present_all(&mut self, egl: &khronos_egl::Instance<khronos_egl::Static>) {
-        let bg = self.bg_color;
-        for (_wl, osurface) in &mut self.outputs {
-            if let Some(os) = osurface {
-                if !os.configured {
-                    continue;
-                }
-                if let Some(ref renderer) = os.renderer {
-                    egl.make_current(
-                        self.egl_display,
-                        Some(os.egl_surface),
-                        Some(os.egl_surface),
-                        Some(self.egl_context),
-                    )
-                    .unwrap();
-                    unsafe {
+                        if draw {
+                            // ~2px line in NDC for this output's resolution
+                            let line_width = 4.0 / os.height.min(os.width) as f64;
+                            verts.clear();
+                            self.harmonograph.append_catmull_rom_strip(
+                                self.scale_x,
+                                self.scale_y,
+                                line_width,
+                                16,
+                                &mut verts,
+                            );
+                            if !verts.is_empty() {
+                                renderer.draw_strip(&verts, color, 0.85);
+                            }
+                        }
                         renderer.blit_to_screen(bg);
                     }
-                    egl.swap_buffers(self.egl_display, os.egl_surface).unwrap();
+                    self.egl
+                        .swap_buffers(self.egl_display, os.egl_surface)
+                        .unwrap();
                     os.layer
                         .wl_surface()
                         .damage_buffer(0, 0, os.width as i32, os.height as i32);
@@ -632,26 +581,27 @@ impl App {
             wayland_egl::WlEglSurface::new(wl_surface.id(), width as i32, height as i32)
                 .expect("create WlEglSurface");
 
-        let egl = khronos_egl::Instance::new(khronos_egl::Static);
         let egl_surface = unsafe {
-            egl.create_window_surface(
-                self.egl_display,
-                self.egl_config,
-                wl_egl_surface.ptr() as khronos_egl::NativeWindowType,
-                None,
-            )
-            .expect("create EGL surface")
+            self.egl
+                .create_window_surface(
+                    self.egl_display,
+                    self.egl_config,
+                    wl_egl_surface.ptr() as khronos_egl::NativeWindowType,
+                    None,
+                )
+                .expect("create EGL surface")
         };
 
         // Disable vsync — we drive frame pacing with calloop timer
-        egl.make_current(
-            self.egl_display,
-            Some(egl_surface),
-            Some(egl_surface),
-            Some(self.egl_context),
-        )
-        .unwrap();
-        egl.swap_interval(self.egl_display, 0).unwrap();
+        self.egl
+            .make_current(
+                self.egl_display,
+                Some(egl_surface),
+                Some(egl_surface),
+                Some(self.egl_context),
+            )
+            .unwrap();
+        self.egl.swap_interval(self.egl_display, 0).unwrap();
 
         let os = OutputSurface {
             layer,
@@ -673,21 +623,22 @@ impl App {
     }
 
     fn init_renderer_for_output(&mut self, idx: usize) {
-        let egl = khronos_egl::Instance::new(khronos_egl::Static);
         if let Some((_wl, Some(os))) = self.outputs.get_mut(idx) {
             if os.renderer.is_some() {
                 return;
             }
-            egl.make_current(
-                self.egl_display,
-                Some(os.egl_surface),
-                Some(os.egl_surface),
-                Some(self.egl_context),
-            )
-            .unwrap();
+            self.egl
+                .make_current(
+                    self.egl_display,
+                    Some(os.egl_surface),
+                    Some(os.egl_surface),
+                    Some(self.egl_context),
+                )
+                .unwrap();
 
             let gl = unsafe {
                 glow::Context::from_loader_function(|name| {
+                    // This runs only during init, not per-frame
                     let egl = khronos_egl::Instance::new(khronos_egl::Static);
                     egl.get_proc_address(name)
                         .map_or(std::ptr::null(), |p| p as *const _)
@@ -875,6 +826,7 @@ impl ProvidesRegistryState for App {
 fn init_egl(
     conn: &Connection,
 ) -> (
+    khronos_egl::Instance<khronos_egl::Static>,
     khronos_egl::Display,
     khronos_egl::Context,
     khronos_egl::Config,
@@ -923,7 +875,7 @@ fn init_egl(
         .create_context(egl_display, config, None, &context_attrs)
         .expect("create EGL context");
 
-    (egl_display, context, config)
+    (egl, egl_display, context, config)
 }
 
 // ---------------------------------------------------------------------------
@@ -944,7 +896,7 @@ fn main() {
     let output_state = OutputState::new(&globals, &qh);
     let registry_state = RegistryState::new(&globals);
 
-    let (egl_display, egl_context, egl_config) = init_egl(&conn);
+    let (egl, egl_display, egl_context, egl_config) = init_egl(&conn);
 
     let (fg_colors, bg_color) = colors_from_env();
     let mut rng = rand::thread_rng();
@@ -957,6 +909,7 @@ fn main() {
         layer_shell,
         shm,
         qh: qh.clone(),
+        egl,
         egl_display,
         egl_context,
         egl_config,
