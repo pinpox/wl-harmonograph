@@ -1,0 +1,19 @@
+[package]
+name = "wl-harmonograph"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+calloop = "0.14"
+calloop-wayland-source = "0.4"
+rand = "0.8"
+log = "0.4"
+env_logger = "0.10"
+
+# EGL + OpenGL ES for GPU-accelerated rendering
+khronos-egl = { version = "6", features = ["static"] }
+wayland-egl = "0.32"
+glow = "0.16"
